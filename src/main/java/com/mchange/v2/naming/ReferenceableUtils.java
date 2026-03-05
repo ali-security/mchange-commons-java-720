@@ -36,12 +36,13 @@
 package com.mchange.v2.naming;
 
 import java.net.*;
+import java.util.*;
 import javax.naming.*;
+import com.mchange.v2.cfg.MultiPropertiesConfig;
 import com.mchange.v2.log.MLevel;
 import com.mchange.v2.log.MLog;
 import com.mchange.v2.log.MLogger;
 import javax.naming.spi.ObjectFactory;
-import java.util.Hashtable;
 
 public final class ReferenceableUtils
 {
@@ -68,13 +69,36 @@ public final class ReferenceableUtils
 	    return s;
     }
 
-    public static Object referenceToObject( Reference ref, Name name, Context nameCtx, Hashtable env)
+    public static Object referenceToObject( Reference ref, Name name, Context nameCtx, Hashtable env )
+	throws NamingException
+    { return referenceToObject( ref, name, nameCtx, env, (MultiPropertiesConfig) null ); }
+
+    public static Object referenceToObject( Reference ref, Name name, Context nameCtx, Hashtable env, MultiPropertiesConfig mcfg )
 	throws NamingException
     {
 	try
 	    {
 		String fClassName = ref.getFactoryClassName();
 		String fClassLocation = ref.getFactoryClassLocation();
+
+		// Reject references with no factory class name; we do not implement
+		// the NamingManager fallback conventions for null factoryClassName.
+		if (fClassName == null)
+		    throw new NamingException(
+			"A null factoryClassName was encountered. " +
+			"ReferenceableUtils.referenceToObject(...) does not support null factory class names. " +
+			"If the null is intentional, consider using javax.naming.spi.NamingManager.getObjectInstance(...) " +
+			"which employs certain conventions to dereference with an unspecified factoryClassName. " +
+			"Reference: " + ref
+		    );
+
+		// Enforce factory-class whitelist when one has been configured.
+		Set allowedFactoryClassNames = findObjectFactoryWhitelist( mcfg );
+		if (allowedFactoryClassNames != null && !allowedFactoryClassNames.contains(fClassName))
+		    throw new NamingException(
+			"factoryClassName '" + fClassName + "' is not in the configured " +
+			SecurityConfigKey.OBJECT_FACTORY_WHITELIST + " [" + allowedFactoryClassNames + "]"
+		    );
 
 		ClassLoader defaultClassLoader = Thread.currentThread().getContextClassLoader();
 		if ( defaultClassLoader == null ) defaultClassLoader = ReferenceableUtils.class.getClassLoader();
@@ -84,8 +108,28 @@ public final class ReferenceableUtils
 		    cl = defaultClassLoader;
 		else
 		    {
-			URL u = new URL( fClassLocation );
-			cl = new URLClassLoader( new URL[] { u }, defaultClassLoader );
+			if ( supportReferenceRemoteFactoryClassLocation( mcfg ) )
+			    {
+				URL u = new URL( fClassLocation );
+				cl = new URLClassLoader( new URL[] { u }, defaultClassLoader );
+			    }
+			else
+			    {
+				if ( logger.isLoggable( MLevel.WARNING ) )
+				    logger.log(
+					MLevel.WARNING,
+					"A javax.naming.Reference we have been tasked to dereference specifies a potentially remote " +
+					"factory class location '" + fClassLocation + "'. " +
+					"This is dangerous – a malicious reference could load and execute arbitrary code. " +
+					"Remote factory class loading is disabled by default (CVE-2026-27727). " +
+					"The factoryClassLocation will be ignored; dereferencing will proceed using " +
+					"the calling Thread's context ClassLoader (or the ClassLoader that loaded " +
+					"com.mchange.v2.naming.ReferenceableUtils). " +
+					"To re-enable remote class loading set system property '" +
+					SecurityConfigKey.SUPPORT_REFERENCE_REMOTE_FACTORY_CLASS_LOCATION + "=true'."
+				    );
+				cl = defaultClassLoader;
+			    }
 		    }
 		
 		Class fClass = Class.forName( fClassName, true, cl );
@@ -96,7 +140,6 @@ public final class ReferenceableUtils
 	    {
 		if (Debug.DEBUG) 
 		    {
-			//e.printStackTrace();
 			if ( logger.isLoggable( MLevel.FINE ) )
 			    logger.log( MLevel.FINE, "Could not resolve Reference to Object!", e);
 		    }
@@ -106,6 +149,133 @@ public final class ReferenceableUtils
 	    }
     }
 
+    public static boolean nameLocalityIsAcceptable( Object jndiName, MultiPropertiesConfig mcfg )
+    {
+	boolean resolveNonlocal = permitNonlocalJndiNames( mcfg );
+	if ( jndiName instanceof String )
+	    return resolveNonlocal || jndiNameIsLocal((String) jndiName);
+	else if ( jndiName instanceof Name )
+	    return resolveNonlocal || jndiNameIsLocal((Name) jndiName);
+	else
+	    {
+		if ( logger.isLoggable( MLevel.WARNING ) )
+		    logger.log(
+			MLevel.WARNING,
+			"Putative JNDI name of unexpected type. We expect String or javax.naming.Name. " +
+			"We conservatively, redundantly, disallow any attempt to lookup of jndi names of unknown types. There is no API to do so. " +
+			"Putative JNDI name: " + jndiName
+		    );
+		return false;
+	    }
+    }
+
+    public static boolean jndiNameIsLocal( String name )
+    { return name.startsWith("java:"); }
+
+    public static boolean jndiNameIsLocal( Name name )
+    {
+	// for now we don't know how to prove to ourselves that a javax.naming.Name is local
+	// we are open to suggestions!
+	return false;
+    }
+
+    public static boolean permitNonlocalJndiNames( MultiPropertiesConfig mcfg )
+    { return falseBiasedLookupSyspropsPropertiesConfig( SecurityConfigKey.PERMIT_NONLOCAL_JNDI_NAMES, mcfg ); }
+
+    private static boolean supportReferenceRemoteFactoryClassLocation( MultiPropertiesConfig mcfg )
+    { return falseBiasedLookupSyspropsPropertiesConfig( SecurityConfigKey.SUPPORT_REFERENCE_REMOTE_FACTORY_CLASS_LOCATION, mcfg ); }
+
+    private static boolean falseBiasedLookupSyspropsPropertiesConfig( String propStyleKey, MultiPropertiesConfig mcfg )
+    {
+	String systemPropertiesBasedShouldSupportStr = System.getProperty( propStyleKey );
+	Boolean systemPropertiesBasedShouldSupport = systemPropertiesBasedShouldSupportStr == null ? null : Boolean.valueOf( systemPropertiesBasedShouldSupportStr );
+
+	Boolean mcfgBasedShouldSupport;
+	if ( mcfg != null )
+	    {
+		String mcfgBasedShouldSupportStr = mcfg.getProperty( propStyleKey );
+		mcfgBasedShouldSupport = mcfgBasedShouldSupportStr == null ? null : Boolean.valueOf( mcfgBasedShouldSupportStr );
+	    }
+	else
+	    mcfgBasedShouldSupport = null;
+
+	if ( Boolean.FALSE.equals( systemPropertiesBasedShouldSupport ) )
+	    {
+		if ( Boolean.TRUE.equals( mcfgBasedShouldSupport ) && logger.isLoggable( MLevel.WARNING ) )
+		    logger.log(
+			MLevel.WARNING,
+			"Security-sensitive property '" + propStyleKey +
+			"' has been set to 'false' in System properties. Disabling loading of remote factory classes in System properties " +
+			"OVERRIDES any configuration of this property set elsewhere, regardless of any alternative prioritization of system properties you may have configured. " +
+			"Please resolve the inconsistency of configuration."
+		    );
+		return false;
+	    }
+	else if ( Boolean.TRUE.equals( systemPropertiesBasedShouldSupport ) )
+	    {
+		if ( Boolean.FALSE.equals( mcfgBasedShouldSupport ) )
+		    {
+			if ( logger.isLoggable( MLevel.WARNING ) )
+			    logger.log(
+				MLevel.WARNING,
+				"Security-sensitive property '" + propStyleKey +
+				"' has been set to 'true' in System properties, however it has been set to 'false' in other configuration supplied. Disabling loading of remote factory classes in " +
+				"supplied configuration overrides permission granted in System properties. " +
+				"Please resolve the inconsistency of configuration."
+			    );
+			return false;
+		    }
+		else
+		    return true;
+	    }
+	else
+	    return Boolean.TRUE.equals( mcfgBasedShouldSupport );
+    }
+
+    private static Set findObjectFactoryWhitelist( MultiPropertiesConfig mcfg )
+    {
+	String rawSysProp  = System.getProperty( SecurityConfigKey.OBJECT_FACTORY_WHITELIST );
+	String rawMcfgProp = mcfg == null ? null : mcfg.getProperty( SecurityConfigKey.OBJECT_FACTORY_WHITELIST );
+
+	if (rawSysProp == null && rawMcfgProp == null)
+	    return null;
+	else if (rawSysProp != null && rawMcfgProp == null)
+	    return commaSeparatedStringListToSet( rawSysProp );
+	else if (rawSysProp == null && rawMcfgProp != null)
+	    return commaSeparatedStringListToSet( rawMcfgProp );
+	else
+	    {
+		Set sysPropSet  = new HashSet( Arrays.asList( rawSysProp.split("\\s*,\\s*") ) );
+		Set mcfgPropSet = new HashSet( Arrays.asList( rawMcfgProp.split("\\s*,\\s*") ) );
+
+		if ( sysPropSet.equals( mcfgPropSet ) )
+		    return Collections.unmodifiableSet( sysPropSet );
+		else
+		    {
+			sysPropSet.retainAll( mcfgPropSet );
+			Set out = Collections.unmodifiableSet( sysPropSet );
+			if ( logger.isLoggable( MLevel.WARNING ) )
+			    logger.log(
+				MLevel.WARNING,
+				"Inconsistent values of '" + SecurityConfigKey.OBJECT_FACTORY_WHITELIST +
+				"' were found in System properties and the provided configuration. " +
+				"Conservatively using the *intersection* of those values. " +
+				"System properties value: '" + rawSysProp + "'; " +
+				"Configuration value: '" + rawMcfgProp + "'; " +
+				"Intersection: " + out
+			    );
+			return out;
+		    }
+	    }
+    }
+
+    private static Set commaSeparatedStringListToSet( String csList )
+    {
+	String[] items = csList.split("\\s*,\\s*");
+	return Collections.unmodifiableSet( new HashSet( Arrays.asList( items ) ) );
+    }
+
+    
     /**
      * @deprecated nesting references seemed useful until I realized that
      *             references are Serializable and can be stored in a BinaryRefAddr.
@@ -157,7 +327,6 @@ public final class ReferenceableUtils
 	    {
 		if (Debug.DEBUG) 
 		    {
-			//e.printStackTrace();
 			if ( logger.isLoggable( MLevel.FINE ) )
 			    logger.log( MLevel.FINE, "Version or size nested reference was not a number!!!", e);
 		    }
